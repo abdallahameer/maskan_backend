@@ -1,0 +1,40 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "maskan-backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-29",
+  "env": {
+    "dev": {
+      "name": "maskan-api-dev",
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "maskan-db-dev",
+          "database_id": "83241e0f-1284-4b87-b1bc-48f783cb6a6b",
+        },
+      ],
+      "r2_buckets": [
+        {
+          "binding": "BUCKET",
+          "bucket_name": "maskan-files-dev",
+        },
+      ],
+    },
+    "production": {
+      "name": "maskan-api",
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "maskan-db-prod",
+          "database_id": "026d1bb3-8216-4d7e-894c-3c2aea2722a9",
+        },
+      ],
+      "r2_buckets": [
+        {
+          "binding": "BUCKET",
+          "bucket_name": "maskan-files-prod",
+        },
+      ],
+    },
+  },
+}
