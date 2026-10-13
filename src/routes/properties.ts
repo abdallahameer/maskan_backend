@@ -1,13 +1,447 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
+import { verify } from "hono/jwt";
 import { requireAuth } from "../utils/auth";
 
 type Bindings = { DB: D1Database; JWT_SECRET: string; BUCKET: R2Bucket };
 
+// ---------------------------------------------------------------------------
+// What the app receives for every property
+// ---------------------------------------------------------------------------
+
+export type ListingType = "sale" | "rent";
+export type PropertyCategory = "residential" | "commercial";
+export type PropertyStatus = "ready" | "underConstruction";
+export type FamilyOrSingle = "family" | "single";
+export type PaymentFrequency = "monthly" | "yearly" | "daily";
+
+export type PropertyLocation = {
+  city: string;
+  neighborhood: string;
+  latitude: number;
+  longitude: number;
+};
+
+export type Property = {
+  id: string;
+  ownerId: string;
+  title: string;
+  description: string;
+  price: number;
+  area: number;
+  listingType: ListingType;
+  propertyType: PropertyCategory;
+  propertyStatus: PropertyStatus;
+  familyOrSingle: FamilyOrSingle;
+  paymentType: PaymentFrequency;
+  rooms: number;
+  bathrooms: number;
+  livingRoom: number;
+  floorNumber: number;
+  propertyAge: number;
+  furnished: boolean;
+  kitchen: boolean;
+  annex: boolean;
+  carEntrance: boolean;
+  elevator: boolean;
+  airConditioners: boolean;
+  water: boolean;
+  roof: boolean;
+  electricity: boolean;
+  solarSystem: boolean;
+  images: string[];
+  videos: string[];
+  location: PropertyLocation;
+  phone?: string;
+  phoneKey?: string;
+  whatsapp?: string;
+  whatsAppKey?: string;
+  originalPrice?: number;
+  views: number;
+  createdAt: string;
+  updatedAt: string;
+  isFavorite?: boolean;
+  postedAt?: string;
+};
+
+// ---------------------------------------------------------------------------
+// Limits for files sent together with a new property
+// (a Worker has limited memory, so keep videos small)
+// ---------------------------------------------------------------------------
+
+const MAX_IMAGES = 10;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB per photo
+const MAX_VIDEO_BYTES = 40 * 1024 * 1024; // 40 MB for the video
+const MAX_TOTAL_BYTES = 50 * 1024 * 1024; // 50 MB for everything together
+
+const FILE_EXTENSIONS: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/heic": "heic",
+  "image/heif": "heif",
+  "video/mp4": "mp4",
+  "video/quicktime": "mov",
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Files are stored in R2 under a "key" (like properties/12/photo-1.jpg).
+// The app gets a full link that this same server can serve (see /media below).
+const OLD_PUBLIC_BASE = "https://files-dev.maskan.app/";
+
+function toPublicUrl(stored: string, origin: string): string {
+  let key = stored;
+  if (key.startsWith(OLD_PUBLIC_BASE)) {
+    key = key.slice(OLD_PUBLIC_BASE.length); // older rows saved the full link
+  } else if (/^https?:\/\//.test(key)) {
+    return key;
+  }
+  return `${origin}/properties/media/${key}`;
+}
+
+// SQLite gives "YYYY-MM-DD HH:MM:SS" (UTC). Convert it to an ISO string.
+function toIso(value: string | null | undefined): string {
+  if (!value) return "";
+  return value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
+}
+
+// A property row plus the names of its city and area (both are optional).
+const PROPERTY_SELECT = `
+  SELECT p.*, c.name AS city_name, a.name AS area_name
+  FROM properties p
+  LEFT JOIN cities c ON c.id = p.city_id
+  LEFT JOIN areas a ON a.id = p.area_id
+`;
+
+function toProperty(
+  row: Record<string, any>,
+  images: string[],
+  origin: string,
+  isFavorite?: boolean,
+): Property {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    title: row.title,
+    description: row.description,
+    price: row.price,
+    area: row.area_size ?? 0,
+    listingType: row.listing_type,
+    propertyType: row.property_type,
+    propertyStatus: row.property_status,
+    familyOrSingle: row.family_or_single ?? undefined,
+    paymentType: row.payment_type ?? undefined,
+    rooms: row.rooms,
+    bathrooms: row.bathrooms,
+    livingRoom: row.living_room,
+    floorNumber: row.floor_number,
+    propertyAge: row.property_age,
+    furnished: !!row.furnished,
+    kitchen: !!row.kitchen,
+    annex: !!row.annex,
+    carEntrance: !!row.car_entrance,
+    elevator: !!row.elevator,
+    airConditioners: !!row.air_conditioners,
+    water: !!row.water,
+    roof: !!row.roof,
+    electricity: !!row.electricity,
+    solarSystem: !!row.solar_system,
+    images,
+    videos: row.video_url ? [toPublicUrl(row.video_url, origin)] : [],
+    location: {
+      city: row.city_name ?? "",
+      neighborhood: row.area_name ?? "",
+      latitude: row.latitude ?? 0,
+      longitude: row.longitude ?? 0,
+    },
+    phone: row.contact_phone ?? undefined,
+    phoneKey: row.phone_key ?? undefined,
+    whatsapp: row.contact_whatsapp ?? undefined,
+    whatsAppKey: row.whatsapp_key ?? undefined,
+    views: row.views,
+    createdAt: toIso(row.created_at),
+    updatedAt: toIso(row.updated_at),
+    isFavorite,
+  } as Property;
+}
+
+// Reads the logged-in user from the token if there is one (no error if not).
+async function getOptionalUserId(
+  c: Context<{ Bindings: Bindings }>,
+): Promise<number | null> {
+  const header = c.req.header("Authorization");
+  if (!header || !header.startsWith("Bearer ")) return null;
+
+  try {
+    const payload = await verify(
+      header.replace("Bearer ", ""),
+      c.env.JWT_SECRET,
+      "HS256",
+    );
+    return Number(payload.sub);
+  } catch {
+    return null;
+  }
+}
+
+// Turns database rows into Property objects, adding each one's images
+// (and isFavorite when we know who is asking) with only two extra queries.
+async function toProperties(
+  c: Context<{ Bindings: Bindings }>,
+  rows: Record<string, any>[],
+  userId: number | null,
+): Promise<Property[]> {
+  if (rows.length === 0) return [];
+
+  const db = c.env.DB;
+  const origin = new URL(c.req.url).origin;
+  const ids = rows.map((r) => r.id);
+  const placeholders = ids.map(() => "?").join(",");
+
+  const imageRows = await db
+    .prepare(
+      `SELECT property_id, url FROM property_images
+       WHERE property_id IN (${placeholders})
+       ORDER BY position ASC, id ASC`,
+    )
+    .bind(...ids)
+    .all<{ property_id: number; url: string }>();
+
+  const imagesByProperty = new Map<number, string[]>();
+  for (const img of imageRows.results) {
+    const list = imagesByProperty.get(img.property_id) ?? [];
+    list.push(toPublicUrl(img.url, origin));
+    imagesByProperty.set(img.property_id, list);
+  }
+
+  let favoriteIds: Set<number> | null = null;
+  if (userId !== null) {
+    const favRows = await db
+      .prepare(
+        `SELECT property_id FROM favorites
+         WHERE user_id = ? AND property_id IN (${placeholders})`,
+      )
+      .bind(userId, ...ids)
+      .all<{ property_id: number }>();
+    favoriteIds = new Set(favRows.results.map((f) => f.property_id));
+  }
+
+  return rows.map((row) =>
+    toProperty(
+      row,
+      imagesByProperty.get(row.id) ?? [],
+      origin,
+      favoriteIds ? favoriteIds.has(row.id) : undefined,
+    ),
+  );
+}
+
+// Returns an error message (Arabic) if the files are not acceptable.
+function checkMedia(images: File[], video: File | null): string | null {
+  if (images.length > MAX_IMAGES) {
+    return `الحد الأقصى ${MAX_IMAGES} صور`;
+  }
+  let total = 0;
+  for (const image of images) {
+    if (!image.type.startsWith("image/")) return "أحد الملفات ليس صورة";
+    if (image.size > MAX_IMAGE_BYTES) return "حجم إحدى الصور كبير جداً";
+    total += image.size;
+  }
+  if (video) {
+    if (!video.type.startsWith("video/")) return "ملف الفيديو غير صالح";
+    if (video.size > MAX_VIDEO_BYTES) return "حجم الفيديو كبير جداً";
+    total += video.size;
+  }
+  if (total > MAX_TOTAL_BYTES) return "حجم الملفات كبير جداً";
+  return null;
+}
+
+// The app sends the city and area NAMES the user picked from the fixed list
+// (the cities / areas tables). This finds their ids, and rejects names that
+// are not in the list or an area that does not belong to the city.
+async function resolveLocation(
+  db: D1Database,
+  city: unknown,
+  neighborhood: unknown,
+): Promise<{ cityId: number; areaId: number } | { error: string }> {
+  const cityName = typeof city === "string" ? city.trim() : "";
+  const areaName = typeof neighborhood === "string" ? neighborhood.trim() : "";
+
+  if (!cityName || !areaName) {
+    return { error: "الرجاء اختيار المدينة والمنطقة" };
+  }
+
+  const cityRow = await db
+    .prepare("SELECT id FROM cities WHERE name = ?")
+    .bind(cityName)
+    .first<{ id: number }>();
+  if (!cityRow) {
+    return { error: "المدينة غير موجودة" };
+  }
+
+  const areaRow = await db
+    .prepare("SELECT id FROM areas WHERE city_id = ? AND name = ?")
+    .bind(cityRow.id, areaName)
+    .first<{ id: number }>();
+  if (!areaRow) {
+    return { error: "المنطقة غير موجودة في هذه المدينة" };
+  }
+
+  return { cityId: cityRow.id, areaId: areaRow.id };
+}
+
+const LISTING_TYPES = ["rent", "sale"];
+const PROPERTY_TYPES = ["residential", "commercial"];
+const PROPERTY_STATUSES = ["ready", "underConstruction"];
+const FAMILY_OR_SINGLE = ["family", "single"];
+const PAYMENT_TYPES = ["monthly", "yearly", "daily"];
+
+// Every ad must have these. Returns the names of the fields that are
+// missing or not valid (an empty list means the ad is fine).
+// (City and neighborhood are checked separately, in resolveLocation.)
+function missingFields(body: any): string[] {
+  const missing: string[] = [];
+
+  const text = (v: unknown) => typeof v === "string" && v.trim() !== "";
+  const positive = (v: unknown) =>
+    typeof v === "number" && Number.isFinite(v) && v > 0;
+  // country calling code, like "+249" (Sudan) or "+966" (Saudi Arabia)
+  const callingCode = (v: unknown) =>
+    typeof v === "string" && /^\+[0-9]{1,4}$/.test(v.trim());
+  const oneOf = (v: unknown, list: string[]) =>
+    typeof v === "string" && list.includes(v);
+
+  if (!text(body.title)) missing.push("title");
+  if (!positive(body.price)) missing.push("price");
+  if (!positive(body.areaSize)) missing.push("areaSize");
+  if (!text(body.description)) missing.push("description");
+  if (!text(body.phone)) missing.push("phone");
+  if (!callingCode(body.phoneKey)) missing.push("phoneKey");
+  if (!text(body.whatsapp)) missing.push("whatsapp");
+  if (!callingCode(body.whatsAppKey)) missing.push("whatsAppKey");
+
+  if (!oneOf(body.listingType, LISTING_TYPES)) missing.push("listingType");
+  if (!oneOf(body.propertyType, PROPERTY_TYPES)) missing.push("propertyType");
+  if (!oneOf(body.propertyStatus, PROPERTY_STATUSES)) {
+    missing.push("propertyStatus");
+  }
+
+  // optional, but if it is sent it must be one of the allowed words
+  if (
+    body.familyOrSingle != null &&
+    !oneOf(body.familyOrSingle, FAMILY_OR_SINGLE)
+  ) {
+    missing.push("familyOrSingle");
+  }
+  if (body.paymentType != null && !oneOf(body.paymentType, PAYMENT_TYPES)) {
+    missing.push("paymentType");
+  }
+
+  return missing;
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
 const properties = new Hono<{ Bindings: Bindings }>();
 
+// Serves photos and videos stored in R2 (supports "Range" so videos can play
+// and seek). Anyone can view them, just like the ads themselves.
+properties.get("/media/*", async (c) => {
+  const marker = "/media/";
+  const path = c.req.path;
+  const key = decodeURIComponent(
+    path.slice(path.indexOf(marker) + marker.length),
+  );
+
+  if (!key.startsWith("properties/") || key.includes("..")) {
+    return c.json({ error: "الملف غير موجود" }, 404);
+  }
+
+  const rangeHeader = c.req.header("Range");
+  const object = await c.env.BUCKET.get(
+    key,
+    rangeHeader ? { range: c.req.raw.headers } : undefined,
+  );
+
+  if (!object || !("body" in object)) {
+    return c.json({ error: "الملف غير موجود" }, 404);
+  }
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("ETag", object.httpEtag);
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+
+  let status = 200;
+  const range: any = object.range;
+  if (rangeHeader && range) {
+    const length =
+      range.suffix !== undefined
+        ? Math.min(range.suffix, object.size)
+        : (range.length ?? object.size - (range.offset ?? 0));
+    const offset =
+      range.suffix !== undefined ? object.size - length : (range.offset ?? 0);
+    headers.set(
+      "Content-Range",
+      `bytes ${offset}-${offset + length - 1}/${object.size}`,
+    );
+    headers.set("Content-Length", String(length));
+    status = 206;
+  } else {
+    headers.set("Content-Length", String(object.size));
+  }
+
+  return new Response(object.body, { status, headers });
+});
+
+// Create a property. Send either:
+//  - JSON (just the fields), or
+//  - multipart/form-data with: "data" (the fields as JSON text),
+//    "images" (one or more photo files) and "video" (one video file).
 properties.post("/", requireAuth, async (c) => {
   const userId = c.get("userId");
-  const body = await c.req.json();
+  const contentType = c.req.header("Content-Type") || "";
+
+  let body: any;
+  let imageFiles: File[] = [];
+  let videoFile: File | null = null;
+
+  if (contentType.includes("multipart/form-data")) {
+    const declaredSize = Number(c.req.header("Content-Length") || 0);
+    if (declaredSize > MAX_TOTAL_BYTES + 1024 * 1024) {
+      return c.json({ error: "حجم الملفات كبير جداً" }, 413);
+    }
+
+    const form = await c.req.formData();
+
+    const raw = form.get("data");
+    if (typeof raw !== "string") {
+      return c.json({ error: "بيانات الإعلان مفقودة" }, 400);
+    }
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      return c.json({ error: "بيانات الإعلان غير صالحة" }, 400);
+    }
+
+    imageFiles = form
+      .getAll("images")
+      .filter((f): f is File => typeof f !== "string");
+
+    const video = form.get("video");
+    if (video && typeof video !== "string") {
+      videoFile = video;
+    }
+  } else {
+    body = await c.req.json();
+  }
 
   const {
     title,
@@ -34,23 +468,30 @@ properties.post("/", requireAuth, async (c) => {
     roof,
     electricity,
     solarSystem,
-    cityId,
-    areaId,
-    addressDetail,
+    city,
+    neighborhood,
     latitude,
     longitude,
+    phone,
+    phoneKey,
+    whatsapp,
+    whatsAppKey,
   } = body;
 
-  if (
-    !title ||
-    !description ||
-    !price ||
-    !listingType ||
-    !propertyType ||
-    !propertyStatus ||
-    !cityId
-  ) {
-    return c.json({ error: "الرجاء تعبئة الحقول المطلوبة" }, 400);
+  const missing = missingFields(body);
+  if (missing.length > 0) {
+    return c.json({ error: "الرجاء تعبئة الحقول المطلوبة", missing }, 400);
+  }
+
+  const location = await resolveLocation(c.env.DB, city, neighborhood);
+  if ("error" in location) {
+    return c.json({ error: location.error }, 400);
+  }
+  const { cityId, areaId } = location;
+
+  const mediaError = checkMedia(imageFiles, videoFile);
+  if (mediaError) {
+    return c.json({ error: mediaError }, 400);
   }
 
   const result = await c.env.DB.prepare(
@@ -59,9 +500,10 @@ properties.post("/", requireAuth, async (c) => {
       property_status, family_or_single, payment_type, rooms, bathrooms,
       living_room, floor_number, property_age, area_size, furnished, kitchen,
       annex, car_entrance, elevator, air_conditioners, water, roof,
-      electricity, solar_system, city_id, area_id, address_detail,
-      latitude, longitude
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      electricity, solar_system, city_id, area_id,
+      latitude, longitude, contact_phone, phone_key,
+      contact_whatsapp, whatsapp_key
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   )
     .bind(
       userId,
@@ -90,14 +532,65 @@ properties.post("/", requireAuth, async (c) => {
       electricity ? 1 : 0,
       solarSystem ? 1 : 0,
       cityId,
-      areaId ?? null,
-      addressDetail ?? null,
+      areaId,
       latitude ?? null,
       longitude ?? null,
+      phone.trim(),
+      phoneKey.trim(),
+      whatsapp.trim(),
+      whatsAppKey.trim(),
     )
     .run();
 
   const newPropertyId = result.meta.last_row_id;
+
+  // Save the photos and the video. If anything fails we undo everything,
+  // so the user never ends up with a half-published ad.
+  const uploadedKeys: string[] = [];
+  try {
+    for (let i = 0; i < imageFiles.length; i++) {
+      const file = imageFiles[i];
+      const ext = FILE_EXTENSIONS[file.type] ?? "jpg";
+      const key = `properties/${newPropertyId}/photo-${Date.now()}-${i}.${ext}`;
+
+      await c.env.BUCKET.put(key, file, {
+        httpMetadata: { contentType: file.type },
+      });
+      uploadedKeys.push(key);
+
+      await c.env.DB.prepare(
+        "INSERT INTO property_images (property_id, url, position) VALUES (?, ?, ?)",
+      )
+        .bind(newPropertyId, key, i)
+        .run();
+    }
+
+    if (videoFile) {
+      const ext = FILE_EXTENSIONS[videoFile.type] ?? "mp4";
+      const key = `properties/${newPropertyId}/video-${Date.now()}.${ext}`;
+
+      await c.env.BUCKET.put(key, videoFile, {
+        httpMetadata: { contentType: videoFile.type },
+      });
+      uploadedKeys.push(key);
+
+      await c.env.DB.prepare("UPDATE properties SET video_url = ? WHERE id = ?")
+        .bind(key, newPropertyId)
+        .run();
+    }
+  } catch (err) {
+    console.log("Media upload failed:", err);
+    for (const key of uploadedKeys) {
+      await c.env.BUCKET.delete(key).catch(() => {});
+    }
+    await c.env.DB.prepare("DELETE FROM property_images WHERE property_id = ?")
+      .bind(newPropertyId)
+      .run();
+    await c.env.DB.prepare("DELETE FROM properties WHERE id = ?")
+      .bind(newPropertyId)
+      .run();
+    return c.json({ error: "فشل رفع الملفات، لم يتم نشر الإعلان" }, 500);
+  }
 
   const matches = await c.env.DB.prepare(
     `SELECT DISTINCT user_id FROM saved_searches
@@ -114,7 +607,7 @@ properties.post("/", requireAuth, async (c) => {
       listingType,
       propertyType,
       familyOrSingle ?? null,
-      cityId,
+      cityId ?? null,
       areaId ?? null,
       price,
       price,
@@ -133,6 +626,7 @@ properties.post("/", requireAuth, async (c) => {
   return c.json({ id: newPropertyId }, 201);
 });
 
+// Add one more photo to an existing property
 properties.post("/:id/photos", requireAuth, async (c) => {
   const userId = c.get("userId");
   const id = c.req.param("id");
@@ -151,23 +645,24 @@ properties.post("/:id/photos", requireAuth, async (c) => {
   }
 
   const contentType = c.req.header("Content-Type") || "image/jpeg";
-  const key = `properties/${id}/photo-${Date.now()}.jpg`;
+  const ext = FILE_EXTENSIONS[contentType] ?? "jpg";
+  const key = `properties/${id}/photo-${Date.now()}.${ext}`;
 
   await c.env.BUCKET.put(key, c.req.raw.body, {
     httpMetadata: { contentType },
   });
 
-  const publicUrl = `https://files-dev.maskan.app/${key}`;
-
   const result = await c.env.DB.prepare(
     "INSERT INTO property_images (property_id, url, position) VALUES (?, ?, 0)",
   )
-    .bind(id, publicUrl)
+    .bind(id, key)
     .run();
 
+  const publicUrl = toPublicUrl(key, new URL(c.req.url).origin);
   return c.json({ id: result.meta.last_row_id, url: publicUrl }, 201);
 });
 
+// Add (or replace) the video of an existing property
 properties.post("/:id/video", requireAuth, async (c) => {
   const userId = c.get("userId");
   const id = c.req.param("id");
@@ -186,18 +681,18 @@ properties.post("/:id/video", requireAuth, async (c) => {
   }
 
   const contentType = c.req.header("Content-Type") || "video/mp4";
-  const key = `properties/${id}/video-${Date.now()}.mp4`;
+  const ext = FILE_EXTENSIONS[contentType] ?? "mp4";
+  const key = `properties/${id}/video-${Date.now()}.${ext}`;
 
   await c.env.BUCKET.put(key, c.req.raw.body, {
     httpMetadata: { contentType },
   });
 
-  const publicUrl = `https://files-dev.maskan.app/${key}`;
-
   await c.env.DB.prepare("UPDATE properties SET video_url = ? WHERE id = ?")
-    .bind(publicUrl, id)
+    .bind(key, id)
     .run();
 
+  const publicUrl = toPublicUrl(key, new URL(c.req.url).origin);
   return c.json({ url: publicUrl }, 201);
 });
 
@@ -259,71 +754,78 @@ properties.get("/", async (c) => {
   const params: any[] = [];
 
   if (q.listingType) {
-    conditions.push("listing_type = ?");
+    conditions.push("p.listing_type = ?");
     params.push(q.listingType);
   }
   if (q.propertyType) {
-    conditions.push("property_type = ?");
+    conditions.push("p.property_type = ?");
     params.push(q.propertyType);
   }
   if (q.propertyStatus) {
-    conditions.push("property_status = ?");
+    conditions.push("p.property_status = ?");
     params.push(q.propertyStatus);
   }
   if (q.familyOrSingle) {
-    conditions.push("family_or_single = ?");
+    conditions.push("p.family_or_single = ?");
     params.push(q.familyOrSingle);
   }
   if (q.paymentType) {
-    conditions.push("payment_type = ?");
+    conditions.push("p.payment_type = ?");
     params.push(q.paymentType);
   }
   if (q.furnished === "true" || q.furnished === "false") {
-    conditions.push("furnished = ?");
+    conditions.push("p.furnished = ?");
     params.push(q.furnished === "true" ? 1 : 0);
   }
   if (q.rooms) {
-    conditions.push("rooms = ?");
+    conditions.push("p.rooms = ?");
     params.push(Number(q.rooms));
   }
   if (q.bathrooms) {
-    conditions.push("bathrooms = ?");
+    conditions.push("p.bathrooms = ?");
     params.push(Number(q.bathrooms));
   }
   if (q.minPrice) {
-    conditions.push("price >= ?");
+    conditions.push("p.price >= ?");
     params.push(Number(q.minPrice));
   }
   if (q.maxPrice) {
-    conditions.push("price <= ?");
+    conditions.push("p.price <= ?");
     params.push(Number(q.maxPrice));
   }
   if (q.minArea) {
-    conditions.push("area_size >= ?");
+    conditions.push("p.area_size >= ?");
     params.push(Number(q.minArea));
   }
   if (q.maxArea) {
-    conditions.push("area_size <= ?");
+    conditions.push("p.area_size <= ?");
     params.push(Number(q.maxArea));
   }
+  if (q.city) {
+    conditions.push("c.name = ?");
+    params.push(q.city);
+  }
+  if (q.neighborhood) {
+    conditions.push("a.name = ?");
+    params.push(q.neighborhood);
+  }
   if (q.cityId) {
-    conditions.push("city_id = ?");
+    conditions.push("p.city_id = ?");
     params.push(Number(q.cityId));
   }
   if (q.areaId) {
-    conditions.push("area_id = ?");
+    conditions.push("p.area_id = ?");
     params.push(Number(q.areaId));
   }
   if (q.search) {
     conditions.push(`(
-      title LIKE ? OR
-      description LIKE ? OR
-      address_detail LIKE ? OR
-      city_id IN (SELECT id FROM cities WHERE name LIKE ?) OR
-      area_id IN (SELECT id FROM areas WHERE name LIKE ?)
+      p.title LIKE ? OR
+      p.description LIKE ? OR
+      c.name LIKE ? OR
+      a.name LIKE ?
     )`);
     const term = `%${q.search}%`;
-    params.push(term, term, term, term, term);
+    params.push(term, term, term, term);
   }
 
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -331,44 +833,55 @@ properties.get("/", async (c) => {
   const lat = c.req.query("lat");
   const lng = c.req.query("lng");
 
-  let orderBy = "ORDER BY created_at DESC";
+  let orderBy = "ORDER BY p.created_at DESC";
   let selectExtra = "";
-  const finalParams = [...params];
+  const selectParams: any[] = [];
 
   if (lat && lng) {
     selectExtra = `, (
-      ((latitude - ?) * (latitude - ?)) +
-      ((longitude - ?) * (longitude - ?))
+      ((p.latitude - ?) * (p.latitude - ?)) +
+      ((p.longitude - ?) * (p.longitude - ?))
     ) AS distance_sq`;
-    finalParams.push(Number(lat), Number(lat), Number(lng), Number(lng));
-    orderBy = "ORDER BY latitude IS NULL, distance_sq ASC";
+    selectParams.push(Number(lat), Number(lat), Number(lng), Number(lng));
+    orderBy = "ORDER BY p.latitude IS NULL, distance_sq ASC";
   }
 
+  // The distance placeholders sit in the SELECT part, so they are bound first.
+  const finalParams = [...selectParams, ...params];
+
   const { results } = await c.env.DB.prepare(
-    `SELECT * ${selectExtra} FROM properties ${where} ${orderBy} LIMIT 50`,
+    `SELECT p.*, c.name AS city_name, a.name AS area_name ${selectExtra}
+     FROM properties p
+     LEFT JOIN cities c ON c.id = p.city_id
+     LEFT JOIN areas a ON a.id = p.area_id
+     ${where} ${orderBy} LIMIT 50`,
   )
     .bind(...finalParams)
     .all();
 
-  return c.json({ properties: results });
+  const userId = await getOptionalUserId(c);
+  const list = await toProperties(c, results, userId);
+
+  return c.json({ properties: list });
 });
 
 properties.get("/:id", async (c) => {
   const id = c.req.param("id");
 
-  const property = await c.env.DB.prepare(
-    "SELECT * FROM properties WHERE id = ?",
-  )
+  const row = await c.env.DB.prepare(`${PROPERTY_SELECT} WHERE p.id = ?`)
     .bind(id)
     .first();
 
-  if (!property) {
+  if (!row) {
     return c.json({ error: "العقار غير موجود" }, 404);
   }
 
   await c.env.DB.prepare("UPDATE properties SET views = views + 1 WHERE id = ?")
     .bind(id)
     .run();
+
+  const userId = await getOptionalUserId(c);
+  const [property] = await toProperties(c, [row], userId);
 
   return c.json({ property });
 });
@@ -416,12 +929,26 @@ properties.put("/:id", requireAuth, async (c) => {
     roof,
     electricity,
     solarSystem,
-    cityId,
-    areaId,
-    addressDetail,
+    city,
+    neighborhood,
     latitude,
     longitude,
+    phone,
+    phoneKey,
+    whatsapp,
+    whatsAppKey,
   } = body;
+
+  const missing = missingFields(body);
+  if (missing.length > 0) {
+    return c.json({ error: "الرجاء تعبئة الحقول المطلوبة", missing }, 400);
+  }
+
+  const location = await resolveLocation(c.env.DB, city, neighborhood);
+  if ("error" in location) {
+    return c.json({ error: location.error }, 400);
+  }
+  const { cityId, areaId } = location;
 
   await c.env.DB.prepare(
     `UPDATE properties SET
@@ -430,8 +957,10 @@ properties.put("/:id", requireAuth, async (c) => {
       bathrooms = ?, living_room = ?, floor_number = ?, property_age = ?,
       area_size = ?, furnished = ?, kitchen = ?, annex = ?, car_entrance = ?,
       elevator = ?, air_conditioners = ?, water = ?, roof = ?, electricity = ?,
-      solar_system = ?, city_id = ?, area_id = ?, address_detail = ?,
-      latitude = ?, longitude = ?, updated_at = datetime('now')
+      solar_system = ?, city_id = ?, area_id = ?,
+      latitude = ?, longitude = ?, contact_phone = ?, phone_key = ?,
+      contact_whatsapp = ?, whatsapp_key = ?,
+      updated_at = datetime('now')
     WHERE id = ?`,
   )
     .bind(
@@ -460,10 +989,13 @@ properties.put("/:id", requireAuth, async (c) => {
       electricity ? 1 : 0,
       solarSystem ? 1 : 0,
       cityId,
-      areaId ?? null,
-      addressDetail ?? null,
+      areaId,
       latitude ?? null,
       longitude ?? null,
+      phone.trim(),
+      phoneKey.trim(),
+      whatsapp.trim(),
+      whatsAppKey.trim(),
       id,
     )
     .run();
@@ -503,12 +1035,14 @@ properties.get("/mine/list", requireAuth, async (c) => {
   const userId = c.get("userId");
 
   const { results } = await c.env.DB.prepare(
-    "SELECT * FROM properties WHERE owner_id = ? ORDER BY created_at DESC",
+    `${PROPERTY_SELECT} WHERE p.owner_id = ? ORDER BY p.created_at DESC`,
   )
     .bind(userId)
     .all();
 
-  return c.json({ properties: results });
+  const list = await toProperties(c, results, Number(userId));
+
+  return c.json({ properties: list });
 });
 
 export default properties;
