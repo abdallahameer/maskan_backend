@@ -69,7 +69,8 @@ export type Property = {
 // (a Worker has limited memory, so keep videos small)
 // ---------------------------------------------------------------------------
 
-const MAX_IMAGES = 10;
+const MIN_IMAGES = 1; // every ad needs at least one photo
+const MAX_IMAGES = 10; // ...and at most ten (storage is small)
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB per photo
 const MAX_VIDEO_BYTES = 40 * 1024 * 1024; // 40 MB for the video
 const MAX_TOTAL_BYTES = 50 * 1024 * 1024; // 50 MB for everything together
@@ -242,6 +243,9 @@ async function toProperties(
 
 // Returns an error message (Arabic) if the files are not acceptable.
 function checkMedia(images: File[], video: File | null): string | null {
+  if (images.length < MIN_IMAGES) {
+    return "الرجاء إضافة صورة واحدة على الأقل";
+  }
   if (images.length > MAX_IMAGES) {
     return `الحد الأقصى ${MAX_IMAGES} صور`;
   }
@@ -401,10 +405,11 @@ properties.get("/media/*", async (c) => {
   return new Response(object.body, { status, headers });
 });
 
-// Create a property. Send either:
-//  - JSON (just the fields), or
-//  - multipart/form-data with: "data" (the fields as JSON text),
-//    "images" (one or more photo files) and "video" (one video file).
+// Create a property. Send multipart/form-data with:
+//  - "data": the fields as JSON text
+//  - "images": 1 to 10 photo files
+//  - "video": one video file (optional)
+// (A plain JSON request is refused, because it cannot carry any photo.)
 properties.post("/", requireAuth, async (c) => {
   const userId = c.get("userId");
   const contentType = c.req.header("Content-Type") || "";
@@ -644,6 +649,15 @@ properties.post("/:id/photos", requireAuth, async (c) => {
     return c.json({ error: "غير مصرح لك" }, 403);
   }
 
+  const current = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS total FROM property_images WHERE property_id = ?",
+  )
+    .bind(id)
+    .first<{ total: number }>();
+  if ((current?.total ?? 0) >= MAX_IMAGES) {
+    return c.json({ error: `الحد الأقصى ${MAX_IMAGES} صور لكل إعلان` }, 400);
+  }
+
   const contentType = c.req.header("Content-Type") || "image/jpeg";
   const ext = FILE_EXTENSIONS[contentType] ?? "jpg";
   const key = `properties/${id}/photo-${Date.now()}.${ext}`;
@@ -736,6 +750,30 @@ properties.delete("/:id/photos/:photoId", requireAuth, async (c) => {
   }
   if (existing.owner_id !== userId) {
     return c.json({ error: "غير مصرح لك" }, 403);
+  }
+
+  const photo = await c.env.DB.prepare(
+    "SELECT id FROM property_images WHERE id = ? AND property_id = ?",
+  )
+    .bind(photoId, id)
+    .first();
+  if (!photo) {
+    return c.json({ error: "الصورة غير موجودة" }, 404);
+  }
+
+  const current = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS total FROM property_images WHERE property_id = ?",
+  )
+    .bind(id)
+    .first<{ total: number }>();
+  if ((current?.total ?? 0) <= MIN_IMAGES) {
+    return c.json(
+      {
+        error:
+          "لا يمكن حذف آخر صورة، يجب أن يحتوي الإعلان على صورة واحدة على الأقل",
+      },
+      400,
+    );
   }
 
   await c.env.DB.prepare(
