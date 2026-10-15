@@ -408,7 +408,7 @@ properties.get("/media/*", async (c) => {
 // Create a property. Send multipart/form-data with:
 //  - "data": the fields as JSON text
 //  - "images": 1 to 10 photo files
-//  - "video": one video file (optional)
+//  - "video": one video file, at most 40 MB, any length (optional)
 // (A plain JSON request is refused, because it cannot carry any photo.)
 properties.post("/", requireAuth, async (c) => {
   const userId = c.get("userId");
@@ -440,10 +440,13 @@ properties.post("/", requireAuth, async (c) => {
       .getAll("images")
       .filter((f): f is File => typeof f !== "string");
 
-    const video = form.get("video");
-    if (video && typeof video !== "string") {
-      videoFile = video;
+    const videos = form
+      .getAll("video")
+      .filter((f): f is File => typeof f !== "string");
+    if (videos.length > 1) {
+      return c.json({ error: "يمكن إرفاق فيديو واحد فقط" }, 400);
     }
+    videoFile = videos[0] ?? null;
   } else {
     body = await c.req.json();
   }
@@ -695,10 +698,25 @@ properties.post("/:id/video", requireAuth, async (c) => {
   }
 
   const contentType = c.req.header("Content-Type") || "video/mp4";
+  if (!contentType.startsWith("video/")) {
+    return c.json({ error: "ملف الفيديو غير صالح" }, 400);
+  }
+  if (Number(c.req.header("Content-Length") || 0) > MAX_VIDEO_BYTES) {
+    return c.json({ error: "حجم الفيديو كبير جداً" }, 400);
+  }
+
+  const data = await c.req.arrayBuffer();
+  if (data.byteLength === 0) {
+    return c.json({ error: "ملف الفيديو غير صالح" }, 400);
+  }
+  if (data.byteLength > MAX_VIDEO_BYTES) {
+    return c.json({ error: "حجم الفيديو كبير جداً" }, 400);
+  }
+
   const ext = FILE_EXTENSIONS[contentType] ?? "mp4";
   const key = `properties/${id}/video-${Date.now()}.${ext}`;
 
-  await c.env.BUCKET.put(key, c.req.raw.body, {
+  await c.env.BUCKET.put(key, data, {
     httpMetadata: { contentType },
   });
 
