@@ -865,6 +865,10 @@ properties.get("/", async (c) => {
     conditions.push("a.name = ?");
     params.push(q.neighborhood);
   }
+  // ?hasLocation=true -> only ads that have both a latitude and a longitude
+  if (q.hasLocation === "true") {
+    conditions.push("(p.latitude IS NOT NULL AND p.longitude IS NOT NULL)");
+  }
   if (q.cityId) {
     conditions.push("p.city_id = ?");
     params.push(Number(q.cityId));
