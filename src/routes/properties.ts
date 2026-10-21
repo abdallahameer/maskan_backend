@@ -200,16 +200,20 @@ async function toProperties(
 
   const db = c.env.DB;
   const origin = new URL(c.req.url).origin;
-  const ids = rows.map((r) => r.id);
-  const placeholders = ids.map(() => "?").join(",");
+  // The ids are whole numbers from our own database, so they are written
+  // straight into the queries. (D1 allows only 100 bound values per query,
+  // which would break lists of more than 100 ads.)
+  const idList = rows
+    .map((r) => Number(r.id))
+    .filter((n) => Number.isInteger(n))
+    .join(",");
 
   const imageRows = await db
     .prepare(
       `SELECT property_id, url FROM property_images
-       WHERE property_id IN (${placeholders})
+       WHERE property_id IN (${idList})
        ORDER BY position ASC, id ASC`,
     )
-    .bind(...ids)
     .all<{ property_id: number; url: string }>();
 
   const imagesByProperty = new Map<number, string[]>();
@@ -224,9 +228,9 @@ async function toProperties(
     const favRows = await db
       .prepare(
         `SELECT property_id FROM favorites
-         WHERE user_id = ? AND property_id IN (${placeholders})`,
+         WHERE user_id = ? AND property_id IN (${idList})`,
       )
-      .bind(userId, ...ids)
+      .bind(userId)
       .all<{ property_id: number }>();
     favoriteIds = new Set(favRows.results.map((f) => f.property_id));
   }
@@ -346,6 +350,88 @@ function missingFields(body: any): string[] {
   }
 
   return missing;
+}
+
+// ---------------------------------------------------------------------------
+// Lists: all in one response, or page by page (the app chooses)
+//   GET /properties                    -> every matching ad in one response
+//   GET /properties?page=2&limit=20    -> only that page, plus "pagination"
+// Sending page or limit (or both) turns paging on.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PAGE_SIZE = 20; // used when only ?page= is sent
+const MAX_PAGE_SIZE = 100; // the biggest page that can be asked for
+const MAX_UNPAGED = 1000; // safety limit for the "everything" mode
+
+type Paging = { page: number; limit: number; offset: number };
+
+// Returns null when paging is not asked for. A limit above MAX_PAGE_SIZE is
+// lowered to it; a page or limit that is not a whole number of 1+ is an error.
+function readPaging(
+  query: Record<string, string>,
+): Paging | { error: string } | null {
+  if ((query.page ?? "") === "" && (query.limit ?? "") === "") return null;
+
+  const toInt = (value: string | undefined, fallback: number) => {
+    if (value === undefined || value === "") return fallback;
+    return /^[0-9]+$/.test(value) ? Number(value) : NaN;
+  };
+
+  const page = toInt(query.page, 1);
+  const limit = toInt(query.limit, DEFAULT_PAGE_SIZE);
+
+  if (!Number.isSafeInteger(page) || page < 1) {
+    return { error: "رقم الصفحة غير صالح" };
+  }
+  if (!Number.isSafeInteger(limit) || limit < 1) {
+    return { error: "عدد العناصر في الصفحة غير صالح" };
+  }
+
+  const size = Math.min(limit, MAX_PAGE_SIZE);
+  return { page, limit: size, offset: (page - 1) * size };
+}
+
+// The LIMIT part of the query. Without paging we ask for one ad more than the
+// safety limit, only to find out whether there were more.
+function limitPart(paging: Paging | null) {
+  return paging
+    ? { sql: "LIMIT ? OFFSET ?", params: [paging.limit, paging.offset] }
+    : { sql: "LIMIT ?", params: [MAX_UNPAGED + 1] };
+}
+
+// What the app gets next to the list when it asked for pages
+function pageInfo(page: number, limit: number, total: number) {
+  const totalPages = Math.ceil(total / limit);
+  return { page, limit, total, totalPages, hasMore: page < totalPages };
+}
+
+// Builds the answer of a list endpoint, with or without paging
+async function listResponse(
+  c: Context<{ Bindings: Bindings }>,
+  rows: Record<string, any>[],
+  userId: number | null,
+  paging: Paging | null,
+  countTotal: () => Promise<number>,
+) {
+  if (paging) {
+    const list = await toProperties(c, rows, userId);
+    const total = await countTotal();
+    return c.json({
+      properties: list,
+      pagination: pageInfo(paging.page, paging.limit, total),
+    });
+  }
+
+  const truncated = rows.length > MAX_UNPAGED;
+  const list = await toProperties(
+    c,
+    truncated ? rows.slice(0, MAX_UNPAGED) : rows,
+    userId,
+  );
+  // "truncated" only appears when there were more ads than the safety limit
+  return c.json(
+    truncated ? { properties: list, truncated: true } : { properties: list },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +892,11 @@ properties.delete("/:id/photos/:photoId", requireAuth, async (c) => {
 properties.get("/", async (c) => {
   const q = c.req.query();
 
+  const paging = readPaging(q);
+  if (paging && "error" in paging) {
+    return c.json({ error: paging.error }, 400);
+  }
+
   const conditions: string[] = [];
   const params: any[] = [];
 
@@ -893,7 +984,7 @@ properties.get("/", async (c) => {
   const lat = c.req.query("lat");
   const lng = c.req.query("lng");
 
-  let orderBy = "ORDER BY p.created_at DESC";
+  let orderBy = "ORDER BY p.created_at DESC, p.id DESC";
   let selectExtra = "";
   const selectParams: any[] = [];
 
@@ -903,26 +994,39 @@ properties.get("/", async (c) => {
       ((p.longitude - ?) * (p.longitude - ?))
     ) AS distance_sq`;
     selectParams.push(Number(lat), Number(lat), Number(lng), Number(lng));
-    orderBy = "ORDER BY p.latitude IS NULL, distance_sq ASC";
+    orderBy = "ORDER BY p.latitude IS NULL, distance_sq ASC, p.id DESC";
   }
 
   // The distance placeholders sit in the SELECT part, so they are bound first.
   const finalParams = [...selectParams, ...params];
+
+  const limit = limitPart(paging);
 
   const { results } = await c.env.DB.prepare(
     `SELECT p.*, c.name AS city_name, a.name AS area_name ${selectExtra}
      FROM properties p
      LEFT JOIN cities c ON c.id = p.city_id
      LEFT JOIN areas a ON a.id = p.area_id
-     ${where} ${orderBy} LIMIT 50`,
+     ${where} ${orderBy} ${limit.sql}`,
   )
-    .bind(...finalParams)
+    .bind(...finalParams, ...limit.params)
     .all();
 
   const userId = await getOptionalUserId(c);
-  const list = await toProperties(c, results, userId);
 
-  return c.json({ properties: list });
+  return listResponse(c, results, userId, paging, async () => {
+    // How many ads match in total (same filters, no paging)
+    const counted = await c.env.DB.prepare(
+      `SELECT COUNT(*) AS total
+       FROM properties p
+       LEFT JOIN cities c ON c.id = p.city_id
+       LEFT JOIN areas a ON a.id = p.area_id
+       ${where}`,
+    )
+      .bind(...params)
+      .first<{ total: number }>();
+    return counted?.total ?? 0;
+  });
 });
 
 properties.get("/:id", async (c) => {
@@ -1094,15 +1198,27 @@ properties.delete("/:id", requireAuth, async (c) => {
 properties.get("/mine/list", requireAuth, async (c) => {
   const userId = c.get("userId");
 
+  const paging = readPaging(c.req.query());
+  if (paging && "error" in paging) {
+    return c.json({ error: paging.error }, 400);
+  }
+  const limit = limitPart(paging);
+
   const { results } = await c.env.DB.prepare(
-    `${PROPERTY_SELECT} WHERE p.owner_id = ? ORDER BY p.created_at DESC`,
+    `${PROPERTY_SELECT} WHERE p.owner_id = ?
+     ORDER BY p.created_at DESC, p.id DESC ${limit.sql}`,
   )
-    .bind(userId)
+    .bind(userId, ...limit.params)
     .all();
 
-  const list = await toProperties(c, results, Number(userId));
-
-  return c.json({ properties: list });
+  return listResponse(c, results, Number(userId), paging, async () => {
+    const counted = await c.env.DB.prepare(
+      "SELECT COUNT(*) AS total FROM properties WHERE owner_id = ?",
+    )
+      .bind(userId)
+      .first<{ total: number }>();
+    return counted?.total ?? 0;
+  });
 });
 
 export default properties;
