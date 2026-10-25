@@ -90,6 +90,17 @@ const FILE_EXTENSIONS: Record<string, string> = {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Treat missing/empty placeholder values as if the filter was not supplied.
+// Query parameters arrive as strings, so literal "null" and "undefined" are
+// handled here as well as actual undefined values.
+function hasFilterValue(value: string | undefined): value is string {
+  if (value === undefined) return false;
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized !== "" && normalized !== "null" && normalized !== "undefined"
+  );
+}
+
 // Files are stored in R2 under a "key" (like properties/12/photo-1.jpg).
 // The app gets a full link that this same server can serve (see /media below).
 const OLD_PUBLIC_BASE = "https://files-dev.maskan.app/";
@@ -900,59 +911,65 @@ properties.get("/", async (c) => {
   const conditions: string[] = [];
   const params: any[] = [];
 
-  if (q.listingType) {
+  if (hasFilterValue(q.listingType)) {
     conditions.push("p.listing_type = ?");
     params.push(q.listingType);
   }
-  if (q.propertyType) {
+  if (hasFilterValue(q.propertyType)) {
     conditions.push("p.property_type = ?");
     params.push(q.propertyType);
   }
-  if (q.propertyStatus) {
+  if (
+    hasFilterValue(q.propertyStatus) &&
+    q.propertyStatus.toLowerCase() !== "all"
+  ) {
     conditions.push("p.property_status = ?");
     params.push(q.propertyStatus);
   }
-  if (q.familyOrSingle) {
+  if (hasFilterValue(q.familyOrSingle)) {
     conditions.push("p.family_or_single = ?");
     params.push(q.familyOrSingle);
   }
-  if (q.paymentType) {
+  if (hasFilterValue(q.paymentType)) {
     conditions.push("p.payment_type = ?");
     params.push(q.paymentType);
   }
-  if (q.furnished === "true" || q.furnished === "false") {
+  if (
+    hasFilterValue(q.furnished) &&
+    (q.furnished === "true" || q.furnished === "false")
+  ) {
     conditions.push("p.furnished = ?");
     params.push(q.furnished === "true" ? 1 : 0);
   }
-  if (q.rooms) {
+  if (hasFilterValue(q.rooms)) {
     conditions.push("p.rooms = ?");
     params.push(Number(q.rooms));
   }
-  if (q.bathrooms) {
+  if (hasFilterValue(q.bathrooms)) {
     conditions.push("p.bathrooms = ?");
     params.push(Number(q.bathrooms));
   }
-  if (q.minPrice) {
+  if (hasFilterValue(q.minPrice)) {
     conditions.push("p.price >= ?");
     params.push(Number(q.minPrice));
   }
-  if (q.maxPrice) {
+  if (hasFilterValue(q.maxPrice)) {
     conditions.push("p.price <= ?");
     params.push(Number(q.maxPrice));
   }
-  if (q.minArea) {
+  if (hasFilterValue(q.minArea)) {
     conditions.push("p.area_size >= ?");
     params.push(Number(q.minArea));
   }
-  if (q.maxArea) {
+  if (hasFilterValue(q.maxArea)) {
     conditions.push("p.area_size <= ?");
     params.push(Number(q.maxArea));
   }
-  if (q.city) {
+  if (hasFilterValue(q.city)) {
     conditions.push("c.name = ?");
     params.push(q.city);
   }
-  if (q.neighborhood) {
+  if (hasFilterValue(q.neighborhood)) {
     conditions.push("a.name = ?");
     params.push(q.neighborhood);
   }
@@ -960,15 +977,15 @@ properties.get("/", async (c) => {
   if (q.hasLocation === "true") {
     conditions.push("(p.latitude IS NOT NULL AND p.longitude IS NOT NULL)");
   }
-  if (q.cityId) {
+  if (hasFilterValue(q.cityId)) {
     conditions.push("p.city_id = ?");
     params.push(Number(q.cityId));
   }
-  if (q.areaId) {
+  if (hasFilterValue(q.areaId)) {
     conditions.push("p.area_id = ?");
     params.push(Number(q.areaId));
   }
-  if (q.search) {
+  if (hasFilterValue(q.search)) {
     conditions.push(`(
       p.title LIKE ? OR
       p.description LIKE ? OR
