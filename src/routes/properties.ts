@@ -122,7 +122,7 @@ function toIso(value: string | null | undefined): string {
 }
 
 // A property row plus the names of its city and area (both are optional).
-const PROPERTY_SELECT = `
+export const PROPERTY_SELECT = `
   SELECT p.*, c.name AS city_name, a.name AS area_name
   FROM properties p
   LEFT JOIN cities c ON c.id = p.city_id
@@ -378,7 +378,7 @@ type Paging = { page: number; limit: number; offset: number };
 
 // Returns null when paging is not asked for. A limit above MAX_PAGE_SIZE is
 // lowered to it; a page or limit that is not a whole number of 1+ is an error.
-function readPaging(
+export function readPaging(
   query: Record<string, string>,
 ): Paging | { error: string } | null {
   if ((query.page ?? "") === "" && (query.limit ?? "") === "") return null;
@@ -404,7 +404,7 @@ function readPaging(
 
 // The LIMIT part of the query. Without paging we ask for one ad more than the
 // safety limit, only to find out whether there were more.
-function limitPart(paging: Paging | null) {
+export function limitPart(paging: Paging | null) {
   return paging
     ? { sql: "LIMIT ? OFFSET ?", params: [paging.limit, paging.offset] }
     : { sql: "LIMIT ?", params: [MAX_UNPAGED + 1] };
@@ -417,7 +417,7 @@ function pageInfo(page: number, limit: number, total: number) {
 }
 
 // Builds the answer of a list endpoint, with or without paging
-async function listResponse(
+export async function listResponse(
   c: Context<{ Bindings: Bindings }>,
   rows: Record<string, any>[],
   userId: number | null,

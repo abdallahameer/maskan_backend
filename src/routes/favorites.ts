@@ -1,7 +1,13 @@
 import { Hono } from "hono";
 import { requireAuth } from "../utils/auth";
+import {
+  PROPERTY_SELECT,
+  readPaging,
+  limitPart,
+  listResponse,
+} from "./properties";
 
-type Bindings = { DB: D1Database; JWT_SECRET: string };
+type Bindings = { DB: D1Database; JWT_SECRET: string; BUCKET: R2Bucket };
 
 const favorites = new Hono<{ Bindings: Bindings }>();
 
@@ -47,20 +53,38 @@ favorites.delete("/:propertyId", requireAuth, async (c) => {
   return c.json({ success: true });
 });
 
-// List my saved properties
+// List my saved properties.
+// Same answer as GET /properties: the same Property objects (camelCase, with
+// images, videos, location...), every one with isFavorite = true.
+//   GET /favorites                  -> all of them: { properties: [...] }
+//   GET /favorites?page=2&limit=20  -> one page: { properties, pagination }
+// Newest saved first.
 favorites.get("/", requireAuth, async (c) => {
   const userId = c.get("userId");
 
+  const paging = readPaging(c.req.query());
+  if (paging && "error" in paging) {
+    return c.json({ error: paging.error }, 400);
+  }
+  const limit = limitPart(paging);
+
   const { results } = await c.env.DB.prepare(
-    `SELECT p.* FROM properties p
+    `${PROPERTY_SELECT}
      INNER JOIN favorites f ON f.property_id = p.id
      WHERE f.user_id = ?
-     ORDER BY f.created_at DESC`,
+     ORDER BY f.created_at DESC, f.id DESC ${limit.sql}`,
   )
-    .bind(userId)
+    .bind(userId, ...limit.params)
     .all();
 
-  return c.json({ properties: results });
+  return listResponse(c, results, Number(userId), paging, async () => {
+    const counted = await c.env.DB.prepare(
+      "SELECT COUNT(*) AS total FROM favorites WHERE user_id = ?",
+    )
+      .bind(userId)
+      .first<{ total: number }>();
+    return counted?.total ?? 0;
+  });
 });
 
 export default favorites;
