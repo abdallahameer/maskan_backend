@@ -1,11 +1,11 @@
 import { Hono } from "hono";
 import { requireAuth } from "../utils/auth";
+import { PROPERTY_SELECT } from "../utils/property/mapper";
 import {
-  PROPERTY_SELECT,
-  readPaging,
   limitPart,
   listResponse,
-} from "./properties";
+  readPaging,
+} from "../utils/property/paging";
 
 type Bindings = { DB: D1Database; JWT_SECRET: string; BUCKET: R2Bucket };
 
