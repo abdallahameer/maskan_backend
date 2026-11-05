@@ -6,6 +6,7 @@ import {
   MAX_VIDEO_BYTES,
 } from "../../utils/property/constants";
 import { toPublicUrl } from "../../utils/property/mapper";
+import { deleteStoredFiles } from "../../utils/property/storage";
 
 const video = new Hono<{ Bindings: Bindings }>();
 
@@ -15,10 +16,10 @@ video.post("/:id/video", requireAuth, async (c) => {
   const id = c.req.param("id");
 
   const existing = await c.env.DB.prepare(
-    "SELECT owner_id FROM properties WHERE id = ?",
+    "SELECT owner_id, video_url FROM properties WHERE id = ?",
   )
     .bind(id)
-    .first<{ owner_id: number }>();
+    .first<{ owner_id: number; video_url: string | null }>();
 
   if (!existing) {
     return c.json({ error: "العقار غير موجود" }, 404);
@@ -54,6 +55,9 @@ video.post("/:id/video", requireAuth, async (c) => {
     .bind(key, id)
     .run();
 
+  // The old video (if there was one) is replaced, so remove its file.
+  await deleteStoredFiles(c.env.BUCKET, [existing.video_url]);
+
   const publicUrl = toPublicUrl(key, new URL(c.req.url).origin);
   return c.json({ url: publicUrl }, 201);
 });
@@ -63,10 +67,10 @@ video.delete("/:id/video", requireAuth, async (c) => {
   const id = c.req.param("id");
 
   const existing = await c.env.DB.prepare(
-    "SELECT owner_id FROM properties WHERE id = ?",
+    "SELECT owner_id, video_url FROM properties WHERE id = ?",
   )
     .bind(id)
-    .first<{ owner_id: number }>();
+    .first<{ owner_id: number; video_url: string | null }>();
 
   if (!existing) {
     return c.json({ error: "العقار غير موجود" }, 404);
@@ -78,6 +82,9 @@ video.delete("/:id/video", requireAuth, async (c) => {
   await c.env.DB.prepare("UPDATE properties SET video_url = NULL WHERE id = ?")
     .bind(id)
     .run();
+
+  // Remove the video file from R2 too.
+  await deleteStoredFiles(c.env.BUCKET, [existing.video_url]);
 
   return c.json({ success: true });
 });

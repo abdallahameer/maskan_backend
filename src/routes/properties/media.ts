@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { Bindings } from "../../types";
+import { FILE_EXTENSIONS } from "../../utils/property/constants";
 
 const media = new Hono<{ Bindings: Bindings }>();
 
@@ -8,9 +9,13 @@ const media = new Hono<{ Bindings: Bindings }>();
 media.get("/media/*", async (c) => {
   const marker = "/media/";
   const path = c.req.path;
-  const key = decodeURIComponent(
-    path.slice(path.indexOf(marker) + marker.length),
-  );
+  let key: string;
+  try {
+    key = decodeURIComponent(path.slice(path.indexOf(marker) + marker.length));
+  } catch {
+    // a broken link (like %E0%A4%A) is just "not found", not a server error
+    return c.json({ error: "الملف غير موجود" }, 404);
+  }
 
   if (!key.startsWith("properties/") || key.includes("..")) {
     return c.json({ error: "الملف غير موجود" }, 404);
@@ -31,6 +36,17 @@ media.get("/media/*", async (c) => {
   headers.set("ETag", object.httpEtag);
   headers.set("Accept-Ranges", "bytes");
   headers.set("Cache-Control", "public, max-age=31536000, immutable");
+
+  // These files are served from the same address as the API, so only real
+  // photo / video types are served as they are. Anything else is sent as a
+  // plain download, and the browser is told never to guess a type or run it.
+  const storedType = object.httpMetadata?.contentType ?? "";
+  if (!Object.prototype.hasOwnProperty.call(FILE_EXTENSIONS, storedType)) {
+    headers.set("Content-Type", "application/octet-stream");
+    headers.set("Content-Disposition", "attachment");
+  }
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Content-Security-Policy", "default-src 'none'; sandbox");
 
   let status = 200;
   const range: any = object.range;
