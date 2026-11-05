@@ -9,6 +9,20 @@ export function hasFilterValue(value: string | undefined): value is string {
   );
 }
 
+// "3" means exactly 3. "+8" (or "8+") means 8 or more.
+// (The column name comes from our own code, never from the request.)
+function addCountFilter(
+  column: string,
+  value: string,
+  conditions: string[],
+  params: any[],
+) {
+  const trimmed = value.trim();
+  const orMore = trimmed.startsWith("+") || trimmed.endsWith("+");
+  conditions.push(`${column} ${orMore ? ">=" : "="} ?`);
+  params.push(Number(trimmed.replace("+", "")));
+}
+
 export function buildPropertyFilters(
   q: Record<string, string>,
   lat: string | undefined,
@@ -48,12 +62,10 @@ export function buildPropertyFilters(
     params.push(q.furnished === "true" ? 1 : 0);
   }
   if (hasFilterValue(q.rooms)) {
-    conditions.push("p.rooms = ?");
-    params.push(Number(q.rooms));
+    addCountFilter("p.rooms", q.rooms, conditions, params);
   }
   if (hasFilterValue(q.bathrooms)) {
-    conditions.push("p.bathrooms = ?");
-    params.push(Number(q.bathrooms));
+    addCountFilter("p.bathrooms", q.bathrooms, conditions, params);
   }
   if (hasFilterValue(q.minPrice)) {
     conditions.push("p.price >= ?");

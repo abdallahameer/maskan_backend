@@ -7,6 +7,7 @@ import {
   MIN_IMAGES,
 } from "../../utils/property/constants";
 import { toPublicUrl } from "../../utils/property/mapper";
+import { deleteStoredFiles } from "../../utils/property/storage";
 
 const photos = new Hono<{ Bindings: Bindings }>();
 
@@ -74,10 +75,10 @@ photos.delete("/:id/photos/:photoId", requireAuth, async (c) => {
   }
 
   const photo = await c.env.DB.prepare(
-    "SELECT id FROM property_images WHERE id = ? AND property_id = ?",
+    "SELECT id, url FROM property_images WHERE id = ? AND property_id = ?",
   )
     .bind(photoId, id)
-    .first();
+    .first<{ id: number; url: string }>();
   if (!photo) {
     return c.json({ error: "الصورة غير موجودة" }, 404);
   }
@@ -102,6 +103,9 @@ photos.delete("/:id/photos/:photoId", requireAuth, async (c) => {
   )
     .bind(photoId, id)
     .run();
+
+  // The row is gone, now remove the file itself from R2.
+  await deleteStoredFiles(c.env.BUCKET, [photo.url]);
 
   return c.json({ success: true });
 });

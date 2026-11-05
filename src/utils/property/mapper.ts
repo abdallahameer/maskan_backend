@@ -3,7 +3,7 @@ import type { Bindings, Property } from "../../types";
 
 // Files are stored in R2 under a "key" (like properties/12/photo-1.jpg).
 // The app gets a full link that this same server can serve (see /media below).
-const OLD_PUBLIC_BASE = "https://files-dev.maskan.app/";
+export const OLD_PUBLIC_BASE = "https://files-dev.maskan.app/";
 
 export function toPublicUrl(stored: string, origin: string): string {
   let key = stored;

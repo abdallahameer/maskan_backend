@@ -1,5 +1,3 @@
-export type Bindings = { DB: D1Database; JWT_SECRET: string; BUCKET: R2Bucket };
-
 export type ListingType = "sale" | "rent";
 export type PropertyCategory = "residential" | "commercial";
 export type PropertyStatus = "ready" | "underConstruction";
@@ -53,4 +51,12 @@ export type Property = {
   updatedAt: string;
   isFavorite?: boolean;
   postedAt?: string;
+};
+
+export type Bindings = {
+  DB: D1Database;
+  JWT_SECRET: string;
+  GOOGLE_CLIENT_ID: string;
+  RESEND_API_KEY: string;
+  BUCKET: R2Bucket;
 };

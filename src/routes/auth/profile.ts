@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { hashPassword } from "../../utils/password";
 import { requireAuth } from "../../utils/auth";
 import type { Bindings } from "./types";
+import { deleteStoredFiles } from "../../utils/property/storage";
 
 const profile = new Hono<{ Bindings: Bindings }>();
 
@@ -51,36 +52,62 @@ profile.delete("/me", requireAuth, async (c) => {
   const userId = c.get("userId");
 
   const { results: ownedProperties } = await c.env.DB.prepare(
-    "SELECT id FROM properties WHERE owner_id = ?",
+    "SELECT id, video_url FROM properties WHERE owner_id = ?",
   )
     .bind(userId)
-    .all<{ id: number }>();
+    .all<{ id: number; video_url: string | null }>();
 
-  for (const property of ownedProperties) {
-    await c.env.DB.prepare("DELETE FROM property_images WHERE property_id = ?")
-      .bind(property.id)
-      .run();
-    await c.env.DB.prepare("DELETE FROM favorites WHERE property_id = ?")
-      .bind(property.id)
-      .run();
-    await c.env.DB.prepare("DELETE FROM notifications WHERE property_id = ?")
-      .bind(property.id)
-      .run();
+  // Everything that points to the user's ads is deleted first, then the ads,
+  // then the user's own rows, all in one batch (all of it or none of it).
+  // The ids come from our own database, so they are written into the SQL
+  // (D1 allows only 100 bound values per query, and one request may run only
+  // a limited number of queries, so we do not loop over the ads).
+  const statements: D1PreparedStatement[] = [];
+  let imageUrls: string[] = [];
+
+  if (ownedProperties.length > 0) {
+    const idList = ownedProperties
+      .map((property) => Number(property.id))
+      .filter((n) => Number.isInteger(n))
+      .join(",");
+
+    const images = await c.env.DB.prepare(
+      `SELECT url FROM property_images WHERE property_id IN (${idList})`,
+    ).all<{ url: string }>();
+    imageUrls = images.results.map((row) => row.url);
+
+    statements.push(
+      c.env.DB.prepare(
+        `DELETE FROM notifications WHERE property_id IN (${idList})`,
+      ),
+      c.env.DB.prepare(
+        `DELETE FROM favorites WHERE property_id IN (${idList})`,
+      ),
+      c.env.DB.prepare(
+        `DELETE FROM property_images WHERE property_id IN (${idList})`,
+      ),
+    );
   }
 
-  await c.env.DB.prepare("DELETE FROM properties WHERE owner_id = ?")
-    .bind(userId)
-    .run();
-  await c.env.DB.prepare("DELETE FROM favorites WHERE user_id = ?")
-    .bind(userId)
-    .run();
-  await c.env.DB.prepare("DELETE FROM notifications WHERE user_id = ?")
-    .bind(userId)
-    .run();
-  await c.env.DB.prepare("DELETE FROM saved_searches WHERE user_id = ?")
-    .bind(userId)
-    .run();
-  await c.env.DB.prepare("DELETE FROM users WHERE id = ?").bind(userId).run();
+  statements.push(
+    c.env.DB.prepare("DELETE FROM properties WHERE owner_id = ?").bind(userId),
+    c.env.DB.prepare("DELETE FROM favorites WHERE user_id = ?").bind(userId),
+    c.env.DB.prepare("DELETE FROM notifications WHERE user_id = ?").bind(
+      userId,
+    ),
+    c.env.DB.prepare("DELETE FROM saved_searches WHERE user_id = ?").bind(
+      userId,
+    ),
+    c.env.DB.prepare("DELETE FROM users WHERE id = ?").bind(userId),
+  );
+
+  await c.env.DB.batch(statements);
+
+  // Only now remove the photos and videos from R2.
+  await deleteStoredFiles(c.env.BUCKET, [
+    ...imageUrls,
+    ...ownedProperties.map((property) => property.video_url),
+  ]);
 
   return c.json({ success: true });
 });
